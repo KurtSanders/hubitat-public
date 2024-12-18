@@ -65,6 +65,8 @@ import hubitat.scheduling.AsyncResponse
  *  01/18/23 - 0.3.6 - Fix error in scene triggering
  *  01/24/23 - 0.3.7 - Support fan_speed_percent level
  *  10/23/24 - 0.3.8 - Update tuya auth request
+ *  12/15/24 - 0.3.9 - Added support for controlling a Tuya compatible {eg. Dywarmic Smart Towel Warmer} Towel Rack (Tuya Category: mjj) (kurtsanders)
+ *
  *  Custom component drivers located at https://github.com/bradsjm/hubitat-drivers/tree/master/Component
  */
 
@@ -179,6 +181,8 @@ metadata {
         'smoke'          : ['smoke_sensor_status'],
         'temperatureSet' : ['temp_set'],
         'temperature'    : ['temp_current', 'va_temperature'],
+         //    https://developer.tuya.com/en/docs/iot/f?id=Kakkmrn5290dz
+        'towelRack'      : ['switch', 'temp_set', 'temp_current', 'mode', 'level', 'eco', 'child_lock', 'light', 'temp_unit_convert', 'temp_current_f', 'countdown_set', 'countdown_left', 'state', 'fault'],
         'water'          : ['watersensor_state'],
         'workMode'       : ['work_mode'],
         'workState'      : ['work_state'],
@@ -210,6 +214,7 @@ metadata {
 // Constants
 @Field static final Integer maxMireds = 370 // 2700K
 @Field static final Integer minMireds = 153 // 6536K
+@Field static final String TOWEL_RACK_DEVICE_DRIVER = "Component Generic Towel Rack Device"
 
 // Json Parsing Cache
 @Field static final Map<String, Map> jsonCache = new ConcurrentHashMap<>()
@@ -349,6 +354,8 @@ private static Map mapTuyaCategory(Map d) {
             // Small Home Appliances
         case 'qn':    // Heater
             return [namespace: 'component', driver: 'Generic Component Heating Device']
+        case 'mjj':    // Towel Rack
+            return [namespace: 'component', driver: TOWEL_RACK_DEVICE_DRIVER]
         case 'cs':    // DeHumidifer
             return [namespace: 'component', driver: 'Generic Component DeHumidifer Device']
         case 'fs':    // Fan
@@ -419,11 +426,18 @@ void componentLock(DeviceWrapper dw) {
     LOG.warn "componentLock not yet supported for ${dw}"
 }
 
+// Component command to control a category 'mjj' towel rack
+void componentTowelRack(DeviceWrapper dw, code, mode) {
+    LOG.info "Turning ${dw} ${code}: ${mode} → ${mode?'On':'Off'}"
+    tuyaSendDeviceCommandsAsync(dw.getDataValue('id'), ['code': code, 'value': mode])
+}
+
 // Component command to turn on device
 void componentOn(DeviceWrapper dw) {
     Map<String, Map> functions = getFunctions(dw)
-    String code = getFunctionCode(functions, tuyaFunctions.light + tuyaFunctions.power)
-
+    String code
+    if (dw.typeName == TOWEL_RACK_DEVICE_DRIVER) code = getFunctionCode(functions, tuyaFunctions.power)
+    else code = getFunctionCode(functions, tuyaFunctions.light + tuyaFunctions.power)
     if (code != null) {
         if (txtEnable) {
             LOG.info "Turning ${dw} on"
@@ -446,8 +460,9 @@ void componentOn(DeviceWrapper dw) {
 // Component command to turn off device
 void componentOff(DeviceWrapper dw) {
     Map<String, Map> functions = getFunctions(dw)
-    String code = getFunctionCode(functions, tuyaFunctions.light + tuyaFunctions.power)
-
+    String code
+    if (dw.typeName == TOWEL_RACK_DEVICE_DRIVER) code = getFunctionCode(functions, tuyaFunctions.power)
+    else code = getFunctionCode(functions, tuyaFunctions.light + tuyaFunctions.power)
     if (code != null) {
         if (txtEnable) {
             LOG.info "Turning ${dw} off"
@@ -505,8 +520,15 @@ void componentRefresh(DeviceWrapper dw) {
     if (id != null && dw.getDataValue('functions')) {
         LOG.info "Refreshing ${dw} (${id})"
         tuyaGetStateAsync(id)
-        tuyaSendDeviceCommandsAsync(dw.getDataValue('id'), ['code': 'opposite', 'value': true])
-        // this is for Quoya Smart Curtain, unsure if it affects other devices negatively
+        switch (dw.typeName) {
+            case TOWEL_RACK_DEVICE_DRIVER:
+                // this is to bypass Towel Warmer devices
+                break
+            default:
+                // this is for Quoya Smart Curtain, unsure if it affects other devices negatively
+                tuyaSendDeviceCommandsAsync(dw.getDataValue('id'), ['code': 'opposite', 'value': true])
+            break
+        }
     }
 }
 
@@ -922,7 +944,9 @@ void updated() {
 
 // Called to parse received MQTT data
 void parse(String data) {
+    LOG.debug "==> MQTT Parse(data): data= ${data}"
     Map payload = jsonParser.parseText(interfaces.mqtt.parseMessage(data).payload)
+    LOG.debug "==> MQTT payload= ${payload}"
     try {
         Cipher cipher = tuyaGetCipher(Cipher.DECRYPT_MODE)
         Map result = jsonParser.parse(cipher.doFinal(payload.data.decodeBase64()), 'UTF-8')
@@ -934,7 +958,7 @@ void parse(String data) {
             LOG.warn "Unsupported mqtt packet: ${result}"
         }
     } catch (javax.crypto.BadPaddingException e) {
-        LOG.warn "Decryption error: ${e}"
+        LOG.warn "MQTT Decryption error: ${e}"
         sendEvent([name: 'state', value: 'error', descriptionText: e.message])
         runIn(15 + (3 * random.nextInt(3)), initialize)
     }
@@ -942,6 +966,7 @@ void parse(String data) {
 
 // Called to parse MQTT client status changes
 void mqttClientStatus(String status) {
+    log.debug "==> mqttClientStatus = ${status}"
     switch (status) {
         case 'Status: Connection succeeded':
             LOG.info "Connected to Tuya MQTT hub"
@@ -949,7 +974,7 @@ void mqttClientStatus(String status) {
             runIn(1, 'tuyaHubSubscribeAsync')
             break
         default:
-            LOG.error 'MQTT connection error: ' + status
+            LOG.error 'MQTT Connection error: ' + status
             sendEvent([name: 'state', value: 'disconnected', descriptionText: 'Disconnected from Tuya MQTT hub'])
             runIn(15 + (3 * random.nextInt(3)), initialize)
             break
@@ -1397,7 +1422,7 @@ private void updateMultiDeviceStatus(Map d) {
     String base = "${device.id}-${d.id ?: d.devId}"
     Map<String, ChildDeviceWrapper> children = getChildDevices().collectEntries { child -> [(child.deviceNetworkId): child] }
     Map groups = d.status.groupBy { s -> children["${base}-${s.code}"] ?: children[base] }
-    LOG.debug "Groups: ${groups}"
+//    LOG.debug "Groups: ${groups}"
     groups.each { dw, states ->
         if (dw != null) {
             // send events to child for parsing
@@ -1424,9 +1449,9 @@ private List<Map> createEvents(DeviceWrapper dw, List<Map> statusList) {
     statusList.each { status ->
         if (status.code in tuyaFunctions.workMode) {
             workMode = status.value
+            LOG.debug "${dw} workMode ${workMode}"
         }
     }
-    LOG.debug "${dw} workMode ${workMode}"
 
     return statusList.collectMany { status ->
         LOG.debug "${dw} status ${status}"
@@ -1570,6 +1595,14 @@ private List<Map> createEvents(DeviceWrapper dw, List<Map> statusList) {
                     [name: 'speed', value: 'off', descriptionText: 'speed is off'],
                     [name: 'switch', value: 'off', descriptionText: 'fan is off']
             ]
+        }
+        // For Tuya 'mjj' Towel Rack devices
+        if (status.code in tuyaFunctions.towelRack && status.code in ["switch","light","level","eco","temp_unit_convert","temp_set_f","temp_current_f","countdown_set"]) {
+            String value = status.value ? 'on' : 'off'
+            if (txtEnable) {
+                LOG.info "${dw} ${status.code} is ${value}"
+            }
+            return [[name: status.code, value: value, descriptionText: "${status.code} is ${value}", statusCode: status.code]]
         }
 
         if (status.code in tuyaFunctions.light || status.code in tuyaFunctions.power) {
@@ -2155,7 +2188,7 @@ private void tuyaGetDevicesResponse(AsyncResponse response, Map data) {
 
 // https://developer.tuya.com/en/docs/cloud/device-control?id=K95zu01ksols7#title-29-API%20address
 private void tuyaGetDeviceSpecificationsAsync(String deviceID, Map data = [:]) {
-    LOG.info "Requesting cloud device specifications for ${deviceID}"
+    LOG.info "Requesting cloud device specifications for ${data.name}"
     tuyaGetAsync("/v1.0/devices/${deviceID}/specifications", null, 'tuyaGetDeviceSpecificationsResponse', data)
 }
 
@@ -2196,7 +2229,7 @@ private void tuyaGetDeviceSpecificationsResponse(AsyncResponse response, Map dat
 
 private void tuyaGetHomesAsync() {
     if (state.tokenInfo?.uid != null) {
-        LOG.info 'Requesting Tuya Home list'
+        LOG.info "Requesting Tuya Home list for ${state.tokenInfo.uid}"
         tuyaGetAsync("/v1.0/users/${state.tokenInfo.uid}/homes", null, 'tuyaGetHomesResponse')
     } else {
         LOG.error "Unable to request homes (null uid token: ${state.tokenInfo})"
@@ -2207,6 +2240,7 @@ private void tuyaGetHomesAsync() {
 
 private void tuyaGetHomesResponse(AsyncResponse response, Map data) {
     if (tuyaCheckResponse(response) == false) {
+        LOG.error "Unable to request homes data from Tuya to determine Scenes"
         return
     }
     List<Map> homes = response.json.result ?: []
@@ -2233,7 +2267,7 @@ private void tuyaGetScenesResponse(AsyncResponse response, Map data) {
 }
 
 private void tuyaGetStateAsync(String deviceID) {
-    LOG.debug "Requesting device ${deviceID} state"
+    LOG.debug "Requesting device ${deviceID} status"
     tuyaGetAsync("/v1.0/devices/${deviceID}/status", null, 'tuyaGetStateResponse', [id: deviceID])
 }
 
@@ -2328,6 +2362,8 @@ private void tuyaGetHubConfigAsync() {
 /* groovylint-disable-next-line UnusedPrivateMethod, UnusedPrivateMethodParameter */
 
 private void tuyaGetHubConfigResponse(AsyncResponse response, Map data) {
+    LOG.debug "tuyaGetHubConfigResponse(response) = ${response}"
+    LOG.debug "tuyaGetHubConfigResponse(data) = ${data}"
     if (tuyaCheckResponse(response) == false) {
         return
     }
@@ -2336,7 +2372,7 @@ private void tuyaGetHubConfigResponse(AsyncResponse response, Map data) {
         state.mqttInfo = result
         tuyaHubConnectAsync()
     } else {
-        LOG.warn "Hub response did not contain mqtt details: ${result}"
+        LOG.warn "Hub response did not contain MQTT URL details: ${result}"
     }
 }
 
@@ -2353,16 +2389,18 @@ private void tuyaHubConnectAsync() {
         sendEvent([name: 'state', value: 'error', descriptionText: e.message])
         runIn(15 + (3 * random.nextInt(3)), initialize)
     }
+    LOG.info "Tuya MQTT interfaces.mqtt.isConnected() → ${interfaces.mqtt.isConnected()}"
 }
 
 /* groovylint-disable-next-line UnusedPrivateMethod */
 
 private void tuyaHubSubscribeAsync() {
     state.mqttInfo.source_topic.each { t ->
-        LOG.info "Subscribing to Tuya MQTT hub ${t.key} topic"
+        LOG.info "Subscribing to Tuya MQTT hub ${t.key} topic → (${t.value})"
         interfaces.mqtt.subscribe(t.value)
     }
 
+    LOG.info "Tuya MQTT Subscribe isConnected()→ ${interfaces.mqtt.isConnected()}"
     tuyaGetDevicesAsync()
 }
 

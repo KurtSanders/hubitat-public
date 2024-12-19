@@ -1,5 +1,6 @@
 import groovy.transform.Field
 import java.text.SimpleDateFormat
+import groovy.time.TimeCategory
 
 @Field static final List COUNTDOWNLIST = ["1h","2h","3h","4h","5h","6h","cancel"]
 @Field static final List THERMO_STAT_OPERATING_STATE = ["heating", "idle", "off"]
@@ -27,10 +28,12 @@ metadata {
         attribute "temp_unit_convert", "string"
         attribute "temp_current_f", "string"
         attribute "error", "string"
+        attribute "polling", "boolean"
 
         attribute "thermostatOperatingState", "enum",  THERMO_STAT_OPERATING_STATE
         attribute "thermostatMode", "enum", THERMO_STAT_MODES
 
+        command "adHocPolling", [[name: "Ad Hoc Polling", type:"ENUM", description:"Starts/Stops Polling Outside of Auto Schedule", constraints:['Start','Stop']]]
         command "setHeatingSetpoint", [[name:'Heating Setpoint* 32-270°F', type:'NUMBER', description:'Heating setpoint temperature from 32°F-270°F', range: "32..270"]]
         command "setCountDown", [[name: "Count Down Timer Units*", type:"ENUM", description:"Sets the Count Down Timer [in device dependent increments]", constraints:COUNTDOWNLIST]]
         command "setMode", [[name: "Mode*", type:"ENUM", description:"Set Mode", constraints:MODES]]
@@ -65,12 +68,12 @@ preferences {
 
         input name: "pollingStartTime",
             type: "time",
-            title: "Start Time for Polling",
+            title: "Auto Start Time for Polling",
             required: true
 
             input name: "pollingEndTime",
             type: "time",
-            title: "End Time for Polling",
+            title: "Auto End Time for Polling",
             required: true
     }
 }
@@ -184,34 +187,52 @@ void updated() {
     }
 }
 
-def pollStartTime() {
-    schedule(state.pollCronString, 'refresh')
+void adHocPolling(cmd='Start') {
+    if (cmd.toLowerCase()=='start') {
+        startPolling()
+    } else {
+        stopPolling()
+    }
 }
 
-def pollEndTime() {
+void startPolling() {
+    if (state?.pollCronString) {
+        schedule(state.pollCronString, 'refresh')
+        sendEvent(name: 'polling', value: true)
+    } else {
+        log.error "Start and Stop polling times are not initialized..  Please set and re-try"
+    }
+}
+
+void stopPolling() {
     unschedule('refresh')
+    sendEvent(name: 'polling', value: false)
 }
 
-def pollScheduler(option) {
+void pollScheduler(option) {
     switch (option) {
         case 'unschedule':
         unschedule('refresh')
-        unschedule('pollStartTime')
-        unschedule('pollEndTime')
+        unschedule('startPolling')
+        unschedule('stopPolling')
         break
 
         case 'schedule':
         unschedule('refresh')
 
-        if (!dtCheck()) return
+        def dtPollingStartTime = toDateTime(pollingStartTime)
+        def dtPollingEndTime = toDateTime(pollingEndTime)
+        def dtNow = new Date()
 
-        def startHH = toDateTime(pollingStartTime).format("HH")
-        def endHH   = toDateTime(pollingEndTime).format("HH")
-        def startMM = toDateTime(pollingStartTime).format("mm")
-        def endMM   = toDateTime(pollingEndTime).format("mm")
+        if (!dtCheck(dtPollingStartTime,dtPollingEndTime)) return
 
-        schedule("0 ${startMM} ${startHH} ? * *", 'pollStartTime')
-        schedule("0 ${endMM}   ${endHH}   ? * *", 'pollEndTime')
+        def startHH = dtPollingStartTime.format("HH")
+        def endHH   = dtPollingEndTime.format("HH")
+        def startMM = dtPollingStartTime.format("mm")
+        def endMM   = dtPollingEndTime.format("mm")
+
+        schedule("0 ${startMM} ${startHH} ? * *", 'startPolling')
+        schedule("0 ${endMM}   ${endHH}   ? * *", 'endPolling')
 
         switch (pollInterval) {
             case '0':
@@ -226,6 +247,10 @@ def pollScheduler(option) {
             case '30':
             log.info "Polling scheduled for every ${pollInterval} minutes during ${toDateTime(pollingStartTime).format('h:mm a')} and ${toDateTime(pollingEndTime).format('h:mm a')}"
             state.pollCronString = "0 */${pollInterval} * ? * *"
+            if (dateBetween(dtPollingStartTime, dtPollingEndTime, dtNow)) {
+                log.info "Starting the polling now..."
+                startPolling()
+            }
             break
             default:
                 log.error "Polling Interval '${pollingInterval}' is invalid."
@@ -234,11 +259,12 @@ def pollScheduler(option) {
     }
 }
 
-def dtCheck() {
-    // Validate and Set Polling Interval
-    def dtPollingStartTime = toDateTime(pollingStartTime)
-    def dtPollingEndTime = toDateTime(pollingEndTime)
+def dateBetween(Date date1, Date date2, Date toCheck){
+    return toCheck.after(date1) && toCheck.before(date2)
+}
 
+def dtCheck(Date dtPollingStartTime,Date dtPollingEndTime) {
+    // Validate and Set Polling Interval
     if (dtPollingStartTime > dtPollingEndTime) {
         def errorMSG = "The polling start time of '${toDateTime(pollingStartTime).format('h:mm a')}' is after the polling end time of '${toDateTime(pollingEndTime).format('h:mm a')}'.  Device polling will not be set."
         sendEvent(name:"error",value:"<font color='red'>${errorMSG}</font>")
@@ -247,7 +273,6 @@ def dtCheck() {
     device.deleteCurrentState('error')
     return true
 }
-
 
 /* groovylint-disable-next-line UnusedPrivateMethod */
 private void logsOff() {
